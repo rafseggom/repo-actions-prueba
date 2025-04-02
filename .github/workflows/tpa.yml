@@ -15,7 +15,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Extract issue number and create branch
         run: |
@@ -56,7 +56,7 @@ jobs:
           echo "IS_HOTFIX=$IS_HOTFIX" >> $GITHUB_ENV
           echo "BASE_BRANCH=$BASE_BRANCH" >> $GITHUB_ENV
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
 
       - name: Link issue to branch
         run: |
@@ -70,7 +70,7 @@ jobs:
           # Add development reference to link issue and branch directly in GitHub UI
           gh issue develop ${{ github.event.issue.number }} --name ${{ env.BRANCH_NAME }} --repo ${{ github.repository }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
 
   create-pr-on-in-review:
     runs-on: ubuntu-latest
@@ -80,7 +80,7 @@ jobs:
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Create pull request if not exists
         run: |
@@ -144,7 +144,7 @@ jobs:
           gh issue edit $ISSUE_NUMBER --remove-label "In Progress" --add-label "In Review"
           gh issue comment $ISSUE_NUMBER --body "Issue has been moved to In Review."
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
 
   move-to-done-on-pr-merge:
     runs-on: ubuntu-latest
@@ -171,7 +171,7 @@ jobs:
             echo "IS_HOTFIX=false" >> $GITHUB_ENV
           fi
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
 
       - name: Check remaining PRs for hotfixes
         if: env.ISSUE_NUMBER != '' && env.IS_HOTFIX == 'true'
@@ -190,7 +190,7 @@ jobs:
             gh issue comment ${{ env.ISSUE_NUMBER }} --body "Pull request to ${{ github.event.pull_request.base.ref }} has been merged. Waiting for remaining PRs to be merged before moving to Done."
           fi
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
 
       - name: Move issue to Done (for features)
         if: env.ISSUE_NUMBER != '' && env.IS_HOTFIX == 'false'
@@ -201,4 +201,4 @@ jobs:
           # Comment on the issue
           gh issue comment ${{ env.ISSUE_NUMBER }} --body "This issue has been completed and the pull request has been merged. Moving to Done."
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
