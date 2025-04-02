@@ -1,0 +1,204 @@
+name: Team Practices Automation
+
+on:
+  issues:
+    types: [labeled, unlabeled]
+  pull_request:
+    types: [opened, closed]
+
+jobs:
+  create-branch-on-in-progress:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues' && (contains(github.event.issue.labels.*.name, 'In Progress') || contains(github.event.issue.labels.*.name, 'in-progress'))
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract issue number and create branch
+        run: |
+          ISSUE_NUMBER=${{ github.event.issue.number }}
+          ISSUE_TITLE="${{ github.event.issue.title }}"
+          
+          # Determine if this is a hotfix.
+          IS_HOTFIX=$(gh issue view $ISSUE_NUMBER --json labels -q '.labels[] | select(.name=="Hotfix" or .name=="hotfix") | .name')
+          
+          # Sanitize issue title to create a valid branch name
+          BRANCH_TITLE=$(echo "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-zA-Z0-9]/-/g' | sed 's/--/-/g' | sed 's/^-//' | sed 's/-$//')
+          
+          # Create branch with Git Flow convention, different prefix for hotfixes
+          if [ -n "$IS_HOTFIX" ]; then
+            BRANCH_NAME="hotfix/$ISSUE_NUMBER-$BRANCH_TITLE"
+            BASE_BRANCH="main"
+          else
+            BRANCH_NAME="feature/$ISSUE_NUMBER-$BRANCH_TITLE"
+            BASE_BRANCH="develop"
+          fi
+          
+          # Check if branch already exists
+          if git ls-remote --heads origin $BRANCH_NAME | grep -q $BRANCH_NAME; then
+            echo "Branch $BRANCH_NAME already exists."
+            exit 0
+          fi
+          
+          # Create the branch from the appropriate base
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git checkout $BASE_BRANCH
+          git pull origin $BASE_BRANCH
+          git checkout -b $BRANCH_NAME
+          git push origin $BRANCH_NAME
+          
+          # Save branch name and information for the next step
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+          echo "IS_HOTFIX=$IS_HOTFIX" >> $GITHUB_ENV
+          echo "BASE_BRANCH=$BASE_BRANCH" >> $GITHUB_ENV
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Link issue to branch
+        run: |
+          # Comment on the issue with branch information
+          if [ -n "${{ env.IS_HOTFIX }}" ]; then
+            gh issue comment ${{ github.event.issue.number }} --body "Hotfix branch [${{ env.BRANCH_NAME }}](https://github.com/${{ github.repository }}/tree/${{ env.BRANCH_NAME }}) has been created from ${{ env.BASE_BRANCH }} for this issue."
+          else
+            gh issue comment ${{ github.event.issue.number }} --body "Feature branch [${{ env.BRANCH_NAME }}](https://github.com/${{ github.repository }}/tree/${{ env.BRANCH_NAME }}) has been created for this issue."
+          fi
+          
+          # Add development reference to link issue and branch directly in GitHub UI
+          gh issue develop ${{ github.event.issue.number }} --name ${{ env.BRANCH_NAME }} --repo ${{ github.repository }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  create-pr-on-in-review:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'issues' && (contains(github.event.issue.labels.*.name, 'In Review') || contains(github.event.issue.labels.*.name, 'in-review'))
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create pull request if not exists
+        run: |
+          ISSUE_NUMBER=${{ github.event.issue.number }}
+          
+          # Determine if this is a hotfix
+          IS_HOTFIX=$(gh issue view $ISSUE_NUMBER --json labels -q '.labels[] | select(.name=="Hotfix" or .name=="hotfix") | .name')
+          
+          # Find branch related to this issue
+          if [ -n "$IS_HOTFIX" ]; then
+            BRANCH_PATTERN="hotfix/$ISSUE_NUMBER-"
+            MAIN_TARGET="main"
+            SECONDARY_TARGET="develop"
+          else
+            BRANCH_PATTERN="feature/$ISSUE_NUMBER-"
+            MAIN_TARGET="develop"
+            SECONDARY_TARGET=""
+          fi
+          
+          BRANCH_NAME=$(git ls-remote --heads origin | grep "refs/heads/$BRANCH_PATTERN" | head -n 1 | awk -F'refs/heads/' '{print $2}')
+          
+          if [ -z "$BRANCH_NAME" ]; then
+            echo "No branch found for issue #$ISSUE_NUMBER"
+            exit 1
+          fi
+          
+          # Get issue title for PR title
+          ISSUE_TITLE=$(gh issue view $ISSUE_NUMBER --json title -q '.title')
+          
+          # Check if a PR already exists to main target
+          MAIN_PR_EXISTS=$(gh pr list --head $BRANCH_NAME --base $MAIN_TARGET --json number | jq '.[].number')
+          
+          if [ -z "$MAIN_PR_EXISTS" ]; then
+            # Create main pull request
+            MAIN_PR_NUMBER=$(gh pr create --base $MAIN_TARGET --head $BRANCH_NAME --title "$ISSUE_TITLE" --body "Closes #$ISSUE_NUMBER" --json number -q '.number')
+            echo "Pull request #$MAIN_PR_NUMBER created for branch $BRANCH_NAME to $MAIN_TARGET"
+            
+            # Add comment to issue about the PR
+            gh issue comment $ISSUE_NUMBER --body "Pull Request [#$MAIN_PR_NUMBER](https://github.com/${{ github.repository }}/pull/$MAIN_PR_NUMBER) has been created to $MAIN_TARGET."
+          else
+            echo "Pull request to $MAIN_TARGET already exists (#$MAIN_PR_EXISTS)"
+          fi
+          
+          # For hotfixes, create a second PR to the secondary target if needed
+          if [ -n "$IS_HOTFIX" ] && [ -n "$SECONDARY_TARGET" ]; then
+            SECONDARY_PR_EXISTS=$(gh pr list --head $BRANCH_NAME --base $SECONDARY_TARGET --json number | jq '.[].number')
+            
+            if [ -z "$SECONDARY_PR_EXISTS" ]; then
+              # Create secondary pull request
+              SECONDARY_PR_NUMBER=$(gh pr create --base $SECONDARY_TARGET --head $BRANCH_NAME --title "$ISSUE_TITLE (backport to $SECONDARY_TARGET)" --body "Closes #$ISSUE_NUMBER\n\n*This is a backport of the hotfix to $SECONDARY_TARGET.*" --json number -q '.number')
+              echo "Pull request #$SECONDARY_PR_NUMBER created for branch $BRANCH_NAME to $SECONDARY_TARGET"
+              
+              # Add comment to issue about the secondary PR
+              gh issue comment $ISSUE_NUMBER --body "Additional Pull Request [#$SECONDARY_PR_NUMBER](https://github.com/${{ github.repository }}/pull/$SECONDARY_PR_NUMBER) has been created to $SECONDARY_TARGET."
+            else
+              echo "Pull request to $SECONDARY_TARGET already exists (#$SECONDARY_PR_EXISTS)"
+            fi
+          fi
+          
+          # Remove 'In Progress' label and add 'In Review' label
+          gh issue edit $ISSUE_NUMBER --remove-label "In Progress" --add-label "In Review"
+          gh issue comment $ISSUE_NUMBER --body "Issue has been moved to In Review."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  move-to-done-on-pr-merge:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    steps:
+      - name: Extract issue number from PR body
+        id: extract_issue
+        run: |
+          PR_BODY="${{ github.event.pull_request.body }}"
+          ISSUE_NUMBER=$(echo "$PR_BODY" | grep -o '#[0-9]\+' | head -n 1 | tr -d '#')
+          
+          if [ -z "$ISSUE_NUMBER" ];then
+            echo "No issue number found in PR body"
+            exit 0
+          fi
+          
+          echo "ISSUE_NUMBER=$ISSUE_NUMBER" >> $GITHUB_ENV
+          
+          # Determine if this is a hotfix
+          IS_HOTFIX=$(gh issue view $ISSUE_NUMBER --json labels -q '.labels[] | select(.name=="Hotfix" or .name=="hotfix") | .name')
+          if [ -n "$IS_HOTFIX" ]; then
+            echo "IS_HOTFIX=true" >> $GITHUB_ENV
+          else
+            echo "IS_HOTFIX=false" >> $GITHUB_ENV
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check remaining PRs for hotfixes
+        if: env.ISSUE_NUMBER != '' && env.IS_HOTFIX == 'true'
+        run: |
+          # Find the branch name from current PR
+          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
+          
+          # Check if there are any open PRs for this branch
+          OPEN_PRS=$(gh pr list --head $BRANCH_NAME --state open --json number | jq 'length')
+          
+          if [ "$OPEN_PRS" -eq 0 ]; then
+            # All PRs are merged or closed, move to Done
+            gh issue edit ${{ env.ISSUE_NUMBER }} --remove-label "In Review" --add-label "Done"
+            gh issue comment ${{ env.ISSUE_NUMBER }} --body "All pull requests for this hotfix have been merged. Moving to Done."
+          else
+            gh issue comment ${{ env.ISSUE_NUMBER }} --body "Pull request to ${{ github.event.pull_request.base.ref }} has been merged. Waiting for remaining PRs to be merged before moving to Done."
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Move issue to Done (for features)
+        if: env.ISSUE_NUMBER != '' && env.IS_HOTFIX == 'false'
+        run: |
+          # Remove 'In Review' label and add 'Done' label
+          gh issue edit ${{ env.ISSUE_NUMBER }} --remove-label "In Review" --add-label "Done"
+          
+          # Comment on the issue
+          gh issue comment ${{ env.ISSUE_NUMBER }} --body "This issue has been completed and the pull request has been merged. Moving to Done."
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
