@@ -18,16 +18,53 @@ jobs:
         run: |
           echo "Project event triggered"
           echo "Event name: ${{ github.event_name }}"
-          echo "Event data: ${{ toJSON(github.event) }}"
+          echo "Event action: ${{ github.event.action }}"
+          echo "Project V2 Item Node ID: ${{ github.event.project_v2_item.node_id }}"
+          echo "Changes: ${{ toJSON(github.event.changes) }}"
+          
+          # Si hubo cambios en el campo status
+          if [[ "${{ toJSON(github.event.changes) }}" == *"field_value"* ]]; then
+            echo "Field Node ID: ${{ github.event.changes.field_value.field_node_id }}"
+            echo "Previous value: ${{ github.event.changes.field_value.before }}"
+            echo "Current value: ${{ github.event.changes.field_value.after }}"
+          fi
 
   create-branch-on-in-progress:
     runs-on: ubuntu-latest
+    # Modificamos la condición para aceptar cualquier cambio de status mientras debugging
     if: |
       (github.event_name == 'issues' && (contains(github.event.issue.labels.*.name, 'In Progress') || contains(github.event.issue.labels.*.name, 'in-progress'))) ||
-      (github.event_name == 'project_v2_item' && github.event.changes.field_value.field_node_id == 'FIELD_NODE_ID_STATUS' && github.event.changes.field_value.after == 'In Progress')
+      (github.event_name == 'project_v2_item' && contains(toJSON(github.event.changes), 'field_value'))
     steps:
-      - name: Get issue from project item (if project event)
+      - name: Debug event data
         if: github.event_name == 'project_v2_item'
+        run: |
+          echo "Processing project item event"
+          echo "Changes: ${{ toJSON(github.event.changes) }}"
+          
+          # Extract field_node_id for reference
+          if [[ "${{ toJSON(github.event.changes) }}" == *"field_value"* ]]; then
+            echo "Field Node ID: ${{ github.event.changes.field_value.field_node_id }}"
+            echo "Current value: ${{ github.event.changes.field_value.after }}"
+            
+            # Save field ID for future reference
+            echo "STATUS_FIELD_ID=${{ github.event.changes.field_value.field_node_id }}" >> $GITHUB_ENV
+            
+            # Check if the new status is "In Progress"
+            if [[ "${{ github.event.changes.field_value.after }}" == "In Progress" ]]; then
+              echo "Item moved to In Progress status"
+              echo "SHOULD_PROCESS=true" >> $GITHUB_ENV
+            else
+              echo "Item not moved to In Progress (current status: ${{ github.event.changes.field_value.after }})"
+              echo "SHOULD_PROCESS=false" >> $GITHUB_ENV
+            fi
+          else
+            echo "No field_value changes found"
+            echo "SHOULD_PROCESS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Get issue from project item (if project event)
+        if: github.event_name == 'project_v2_item' && env.SHOULD_PROCESS != 'false'
         id: get-issue
         run: |
           # Usamos GraphQL para obtener la issue relacionada con el project item
@@ -48,6 +85,7 @@ jobs:
           if [ -n "$ISSUE_ID" ]; then
             echo "ISSUE_NUMBER=$ISSUE_ID" >> $GITHUB_ENV
             echo "PROJECT_EVENT=true" >> $GITHUB_ENV
+            echo "Found issue #$ISSUE_ID for this project item"
           else
             echo "No issue found for this project item"
             exit 1
@@ -132,8 +170,38 @@ jobs:
 
   create-pr-on-in-review:
     runs-on: ubuntu-latest
-    if: github.event_name == 'issues' && (contains(github.event.issue.labels.*.name, 'In Review') || contains(github.event.issue.labels.*.name, 'in-review'))
+    if: |
+      (github.event_name == 'issues' && (contains(github.event.issue.labels.*.name, 'In Review') || contains(github.event.issue.labels.*.name, 'in-review'))) ||
+      (github.event_name == 'project_v2_item' && contains(toJSON(github.event.changes), 'field_value') && github.event.changes.field_value.after == 'In Review')
     steps:
+      - name: Get issue from project item (if project event)
+        if: github.event_name == 'project_v2_item'
+        id: get-issue
+        run: |
+          # Usamos GraphQL para obtener la issue relacionada con el project item
+          ISSUE_ID=$(gh api graphql -f query='
+            query($nodeId:ID!) {
+              node(id: $nodeId) {
+                ... on ProjectV2Item {
+                  content {
+                    ... on Issue {
+                      number
+                    }
+                  }
+                }
+              }
+            }' -f nodeId="${{ github.event.project_v2_item.node_id }}" --jq '.data.node.content.number')
+          
+          if [ -n "$ISSUE_ID" ]; then
+            echo "ISSUE_NUMBER=$ISSUE_ID" >> $GITHUB_ENV
+            echo "PROJECT_EVENT=true" >> $GITHUB_ENV
+          else
+            echo "No issue found for this project item"
+            exit 1
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
@@ -142,7 +210,12 @@ jobs:
 
       - name: Create pull request if not exists
         run: |
-          ISSUE_NUMBER=${{ github.event.issue.number }}
+          # Determinar el número de la issue
+          if [ -z "${{ env.ISSUE_NUMBER }}" ]; then
+            ISSUE_NUMBER=${{ github.event.issue.number }}
+          else
+            ISSUE_NUMBER=${{ env.ISSUE_NUMBER }}
+          fi
           
           # Determine if this is a hotfix
           IS_HOTFIX=$(gh issue view $ISSUE_NUMBER --json labels -q '.labels[] | select(.name=="Hotfix" or .name=="hotfix") | .name')
@@ -244,6 +317,12 @@ jobs:
             # All PRs are merged or closed, move to Done
             gh issue edit ${{ env.ISSUE_NUMBER }} --remove-label "In Review" --add-label "Done"
             gh issue comment ${{ env.ISSUE_NUMBER }} --body "All pull requests for this hotfix have been merged. Moving to Done."
+            
+            # Move item to Done in project board
+            if [ -n "${{ github.event.project_v2_item.project_node_id }}" ]; then
+              # Si tuviéramos el ID del proyecto y del status field, podríamos moverlo también aquí...
+              echo "Would move the issue to Done in the project board if we had project info"
+            fi
           else
             gh issue comment ${{ env.ISSUE_NUMBER }} --body "Pull request to ${{ github.event.pull_request.base.ref }} has been merged. Waiting for remaining PRs to be merged before moving to Done."
           fi
@@ -258,5 +337,11 @@ jobs:
           
           # Comment on the issue
           gh issue comment ${{ env.ISSUE_NUMBER }} --body "This issue has been completed and the pull request has been merged. Moving to Done."
+          
+          # Move item to Done in project board
+          if [ -n "${{ github.event.project_v2_item.project_node_id }}" ]; then
+            # Si tuviéramos el ID del proyecto y del status field, podríamos moverlo también aquí...
+            echo "Would move the issue to Done in the project board if we had project info"
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
