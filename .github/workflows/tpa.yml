@@ -5,12 +5,56 @@ on:
     types: [labeled, unlabeled]
   pull_request:
     types: [opened, closed]
+  # Para GitHub Projects (V2)
+  project_v2_item:
+    types: [edited]
 
 jobs:
+  debug-project-event:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'project_v2_item'
+    steps:
+      - name: Debug Project V2 Item Event
+        run: |
+          echo "Project event triggered"
+          echo "Event name: ${{ github.event_name }}"
+          echo "Event data: ${{ toJSON(github.event) }}"
+
   create-branch-on-in-progress:
     runs-on: ubuntu-latest
-    if: github.event_name == 'issues' && (contains(github.event.issue.labels.*.name, 'In Progress') || contains(github.event.issue.labels.*.name, 'in-progress'))
+    if: |
+      (github.event_name == 'issues' && (contains(github.event.issue.labels.*.name, 'In Progress') || contains(github.event.issue.labels.*.name, 'in-progress'))) ||
+      (github.event_name == 'project_v2_item' && github.event.changes.field_value.field_node_id == 'FIELD_NODE_ID_STATUS' && github.event.changes.field_value.after == 'In Progress')
     steps:
+      - name: Get issue from project item (if project event)
+        if: github.event_name == 'project_v2_item'
+        id: get-issue
+        run: |
+          # Usamos GraphQL para obtener la issue relacionada con el project item
+          ISSUE_ID=$(gh api graphql -f query='
+            query($nodeId:ID!) {
+              node(id: $nodeId) {
+                ... on ProjectV2Item {
+                  content {
+                    ... on Issue {
+                      number
+                      title
+                    }
+                  }
+                }
+              }
+            }' -f nodeId="${{ github.event.project_v2_item.node_id }}" --jq '.data.node.content.number')
+          
+          if [ -n "$ISSUE_ID" ]; then
+            echo "ISSUE_NUMBER=$ISSUE_ID" >> $GITHUB_ENV
+            echo "PROJECT_EVENT=true" >> $GITHUB_ENV
+          else
+            echo "No issue found for this project item"
+            exit 1
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
@@ -19,16 +63,26 @@ jobs:
 
       - name: Extract issue number and create branch
         run: |
-          ISSUE_NUMBER=${{ github.event.issue.number }}
-          ISSUE_TITLE="${{ github.event.issue.title }}"
+          # Si venimos de un evento project_v2_item, ya tenemos el ISSUE_NUMBER en env
+          # Si no, tomamos el del evento de issue
+          if [ -z "${{ env.ISSUE_NUMBER }}" ]; then
+            ISSUE_NUMBER=${{ github.event.issue.number }}
+          else
+            ISSUE_NUMBER=${{ env.ISSUE_NUMBER }}
+          fi
           
-          # Determine if this is a hotfix.
+          # Obtener el título de la issue
+          ISSUE_TITLE=$(gh issue view $ISSUE_NUMBER --json title -q '.title')
+          
+          echo "Working with issue #$ISSUE_NUMBER: $ISSUE_TITLE"
+          
+          # Verificar si es un hotfix
           IS_HOTFIX=$(gh issue view $ISSUE_NUMBER --json labels -q '.labels[] | select(.name=="Hotfix" or .name=="hotfix") | .name')
           
-          # Sanitize issue title to create a valid branch name
+          # Sanitizar el título para un nombre de rama válido
           BRANCH_TITLE=$(echo "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-zA-Z0-9]/-/g' | sed 's/--/-/g' | sed 's/^-//' | sed 's/-$//')
           
-          # Create branch with Git Flow convention, different prefix for hotfixes
+          # Crear la rama con convención GitFlow
           if [ -n "$IS_HOTFIX" ]; then
             BRANCH_NAME="hotfix/$ISSUE_NUMBER-$BRANCH_TITLE"
             BASE_BRANCH="main"
@@ -37,13 +91,13 @@ jobs:
             BASE_BRANCH="develop"
           fi
           
-          # Check if branch already exists
+          # Verificar si la rama ya existe
           if git ls-remote --heads origin $BRANCH_NAME | grep -q $BRANCH_NAME; then
             echo "Branch $BRANCH_NAME already exists."
             exit 0
           fi
           
-          # Create the branch from the appropriate base
+          # Crear la rama
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
           git checkout $BASE_BRANCH
@@ -51,24 +105,28 @@ jobs:
           git checkout -b $BRANCH_NAME
           git push origin $BRANCH_NAME
           
-          # Save branch name and information for the next step
+          # Guardar información para el siguiente paso
           echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
           echo "IS_HOTFIX=$IS_HOTFIX" >> $GITHUB_ENV
           echo "BASE_BRANCH=$BASE_BRANCH" >> $GITHUB_ENV
+          echo "ISSUE_NUMBER=$ISSUE_NUMBER" >> $GITHUB_ENV
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
 
       - name: Link issue to branch
         run: |
-          # Comment on the issue with branch information
+          # Comentar en la issue con la información de la rama
           if [ -n "${{ env.IS_HOTFIX }}" ]; then
-            gh issue comment ${{ github.event.issue.number }} --body "Hotfix branch [${{ env.BRANCH_NAME }}](https://github.com/${{ github.repository }}/tree/${{ env.BRANCH_NAME }}) has been created from ${{ env.BASE_BRANCH }} for this issue."
+            gh issue comment ${{ env.ISSUE_NUMBER }} --body "Hotfix branch [${{ env.BRANCH_NAME }}](https://github.com/${{ github.repository }}/tree/${{ env.BRANCH_NAME }}) has been created from ${{ env.BASE_BRANCH }} for this issue."
           else
-            gh issue comment ${{ github.event.issue.number }} --body "Feature branch [${{ env.BRANCH_NAME }}](https://github.com/${{ github.repository }}/tree/${{ env.BRANCH_NAME }}) has been created for this issue."
+            gh issue comment ${{ env.ISSUE_NUMBER }} --body "Feature branch [${{ env.BRANCH_NAME }}](https://github.com/${{ github.repository }}/tree/${{ env.BRANCH_NAME }}) has been created for this issue."
           fi
           
-          # Add development reference to link issue and branch directly in GitHub UI
-          gh issue develop ${{ github.event.issue.number }} --name ${{ env.BRANCH_NAME }} --repo ${{ github.repository }}
+          # Vincular issue y rama en la UI de GitHub
+          gh issue develop ${{ env.ISSUE_NUMBER }} --name ${{ env.BRANCH_NAME }} --repo ${{ github.repository }}
+          
+          # Asegurar que la issue tiene la etiqueta In Progress para consistencia
+          gh issue edit ${{ env.ISSUE_NUMBER }} --add-label "In Progress"
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
 
