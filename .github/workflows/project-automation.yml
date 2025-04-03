@@ -1,22 +1,25 @@
-name: Project Issue Update
+name: Sync Project Board
 on:
-  repository_dispatch:
-    types: [project_updated]
+  issues:
+    types: [labeled, unlabeled, opened, closed]
+  pull_request:
+    types: [opened, closed, merged]
 
 jobs:
-  update-issue:
+  update-project:
     runs-on: ubuntu-latest
     steps:
       - name: Obtener información del evento
-        run: echo "Evento recibido para la Issue ${{ github.event.client_payload.issue_number }}"
+        run: echo "Evento en Issue/PR: ${{ github.event.issue.number || github.event.pull_request.number }}"
 
-      - name: Mover issue a 'Done'
+      - name: Mover Issue en Project V2
         env:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          ISSUE_NUMBER=${{ github.event.client_payload.issue_number }}
-          echo "Actualizando la issue #$ISSUE_NUMBER a la columna 'Done'"
+          ISSUE_NUMBER=${{ github.event.issue.number || github.event.pull_request.number }}
+          echo "Actualizando la Issue #$ISSUE_NUMBER en Project V2"
 
+          # Llamada a la API de GraphQL para actualizar la Issue en el tablero
           QUERY=$(jq -n --arg project "<project_id>" --arg item "<item_id>" --arg done "<done_option_id>" \
             '{query: "mutation { updateProjectV2Item(input: { projectId: $project, itemId: $item, fieldValue: { singleSelectOptionId: $done } }) { projectV2Item { id } } }"}')
 
