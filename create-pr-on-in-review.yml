@@ -1,0 +1,63 @@
+name: Create PR on In Review
+
+on:
+  projects_v2_item:
+    types: [edited]
+
+jobs:
+  create-pr:
+    if: github.event.repository.fork == false
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      projects: write
+      contents: read
+    steps:
+    - name: Check status change
+      id: check_status
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const { changes, projects_v2_item } = context.payload;
+          const statusChange = changes.find(c => 
+            c.field?.name === 'Status' && 
+            c.field.data_type === 'single_select' &&
+            c.field_value?.option_name === 'In Review'
+          );
+          
+          if (!statusChange || projects_v2_item.content_type !== 'Issue') {
+            core.setOutput('trigger', 'false');
+            return;
+          }
+          core.setOutput('trigger', 'true');
+
+    - name: Get issue info
+      if: steps.check_status.outputs.trigger == 'true'
+      id: get_issue
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const { content_node_id } = context.payload.projects_v2_item;
+          const response = await github.graphql(`
+            query ($nodeId: ID!) {
+              node(id: $nodeId) {
+                ... on Issue {
+                  number
+                  title
+                }
+              }
+            }
+          `, { nodeId: content_node_id });
+          
+          core.setOutput('number', response.node.number);
+          core.setOutput('title', response.node.title);
+
+    - name: Create PR
+      if: steps.check_status.outputs.trigger == 'true'
+      uses: repo-sync/pull-request@v2
+      with:
+        destination_branch: "main"
+        github_token: ${{ secrets.PAT_TOKEN }}
+        pr_title: "[#${{ steps.get_issue.outputs.number }}] ${{ steps.get_issue.outputs.title }}"
+        pr_body: "Resolves #${{ steps.get_issue.outputs.number }}"
+        branch_prefix: "feature/"
