@@ -1,0 +1,26 @@
+name: Project Issue Update
+on:
+  repository_dispatch:
+    types: [project_updated]
+
+jobs:
+  update-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obtener información del evento
+        run: echo "Evento recibido para la Issue ${{ github.event.client_payload.issue_number }}"
+
+      - name: Mover issue a 'Done'
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          ISSUE_NUMBER=${{ github.event.client_payload.issue_number }}
+          echo "Actualizando la issue #$ISSUE_NUMBER a la columna 'Done'"
+
+          QUERY=$(jq -n --arg project "<project_id>" --arg item "<item_id>" --arg done "<done_option_id>" \
+            '{query: "mutation { updateProjectV2Item(input: { projectId: $project, itemId: $item, fieldValue: { singleSelectOptionId: $done } }) { projectV2Item { id } } }"}')
+
+          curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$QUERY" \
+            https://api.github.com/graphql
