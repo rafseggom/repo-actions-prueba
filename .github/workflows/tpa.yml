@@ -43,6 +43,7 @@ jobs:
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
+          result-encoding: string
           script: |
             let issueNumber;
             let processType;
@@ -70,7 +71,7 @@ jobs:
                 console.log(`PR event for issue #${issueNumber}, merged: ${context.payload.pull_request.merged}`);
               } else {
                 console.log('No linked issue found in PR body');
-                return {issue: null, process: null};
+                return JSON.stringify({issue: null, process: null});
               }
             }
             
@@ -85,31 +86,33 @@ jobs:
                 
                 console.log(`Issue title: ${issue.title}`);
                 
-                return {
+                return JSON.stringify({
                   issue: {
                     number: issueNumber,
                     title: issue.title,
                     labels: issue.labels.map(l => l.name)
                   },
                   process: processType
-                };
+                });
               } catch (error) {
                 console.error(`Error getting issue #${issueNumber}: ${error.message}`);
-                return {issue: null, process: null};
+                return JSON.stringify({issue: null, process: null});
               }
             }
             
-            return {issue: null, process: null};
+            return JSON.stringify({issue: null, process: null});
 
       - name: Get issue status in project
-        if: fromJson(steps.issue_data.outputs.result).issue
+        if: ${{ fromJson(steps.issue_data.outputs.result).issue }}
         id: project_status
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
+          result-encoding: string
           script: |
-            const issue = fromJson(steps.issue_data.outputs.result).issue;
-            if (!issue) return {status: null};
+            const issueData = JSON.parse(process.env.ISSUE_DATA);
+            const issue = issueData.issue;
+            if (!issue) return JSON.stringify({status: null});
             
             const ownerType = process.env.PROJECT_OWNER_TYPE;
             const owner = process.env.PROJECT_OWNER;
@@ -156,7 +159,7 @@ jobs:
               const statusField = projectPath.fields.nodes.find(field => field.name === statusFieldName);
               if (!statusField) {
                 console.log(`Status field "${statusFieldName}" not found in project`);
-                return {status: null, projectId: projectId};
+                return JSON.stringify({status: null, projectId: projectId});
               }
               
               // Consulta para encontrar el item de la issue en el proyecto
@@ -197,7 +200,7 @@ jobs:
               const items = issueInProject.node.items.nodes;
               if (items.length === 0) {
                 console.log(`Issue #${issue.number} not found in project`);
-                return {status: null, projectId: projectId, statusFieldId: statusField.id};
+                return JSON.stringify({status: null, projectId: projectId, statusFieldId: statusField.id});
               }
               
               // Obtener el estado actual
@@ -212,26 +215,31 @@ jobs:
               
               console.log(`Issue #${issue.number} status in project: ${currentStatus || "Not set"}`);
               
-              return {
+              return JSON.stringify({
                 status: currentStatus,
                 projectId: projectId,
                 itemId: itemId,
                 statusFieldId: statusField.id,
                 statusOptions: statusField.options || []
-              };
+              });
             } catch (error) {
               console.error(`Error querying project: ${error.message}`);
-              return {status: null};
+              return JSON.stringify({status: null});
             }
+        env:
+          ISSUE_DATA: ${{ steps.issue_data.outputs.result }}
 
       - name: Create branch for issue (In Progress)
         if: |
-          fromJson(steps.issue_data.outputs.result).issue && 
-          (fromJson(steps.project_status.outputs.result).status == env.IN_PROGRESS_STATUS || 
-           (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'branch_creation'))
+          ${{ fromJson(steps.issue_data.outputs.result).issue }} && 
+          (${{ fromJson(steps.project_status.outputs.result).status == env.IN_PROGRESS_STATUS }} || 
+           ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'branch_creation' }})
         run: |
-          ISSUE_NUMBER="${{ fromJson(steps.issue_data.outputs.result).issue.number }}"
-          ISSUE_TITLE="${{ fromJson(steps.issue_data.outputs.result).issue.title }}"
+          # Parsear datos desde los pasos anteriores
+          ISSUE_DATA='${{ steps.issue_data.outputs.result }}'
+          ISSUE_NUMBER=$(echo $ISSUE_DATA | jq -r '.issue.number')
+          ISSUE_TITLE=$(echo $ISSUE_DATA | jq -r '.issue.title')
+          LABELS=$(echo $ISSUE_DATA | jq -r '.issue.labels | join(" ")')
           
           # Sanitizar título para nombre de rama
           SANITIZED_TITLE=$(echo "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-zA-Z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
@@ -240,8 +248,6 @@ jobs:
           BRANCH_TYPE="feature"
           
           # Determinar tipo de rama basado en etiquetas
-          LABELS="${{ join(fromJson(steps.issue_data.outputs.result).issue.labels, ' ') }}"
-          
           if echo "$LABELS" | grep -q "documentation"; then
             BRANCH_TYPE="documentation"
           elif echo "$LABELS" | grep -q "bug" || echo "$LABELS" | grep -q "hotfix"; then
@@ -270,14 +276,15 @@ jobs:
 
       - name: Create PR for issue (In Review)
         if: |
-          fromJson(steps.issue_data.outputs.result).issue && 
-          (fromJson(steps.project_status.outputs.result).status == env.IN_REVIEW_STATUS || 
-           (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'pr_creation'))
+          ${{ fromJson(steps.issue_data.outputs.result).issue }} && 
+          (${{ fromJson(steps.project_status.outputs.result).status == env.IN_REVIEW_STATUS }} || 
+           ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'pr_creation' }})
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
           script: |
-            const issue = fromJson(steps.issue_data.outputs.result).issue;
+            const issueData = JSON.parse(process.env.ISSUE_DATA);
+            const issue = issueData.issue;
             const issueNumber = issue.number;
             const issueTitle = issue.title;
             
@@ -331,18 +338,21 @@ jobs:
             } catch (error) {
               console.error(`Error creating PR: ${error.message}`);
             }
+        env:
+          ISSUE_DATA: ${{ steps.issue_data.outputs.result }}
 
       - name: Move issue to Done when PR is merged
         if: |
           github.event_name == 'pull_request' && 
           github.event.pull_request.merged == true && 
-          fromJson(steps.issue_data.outputs.result).issue
+          ${{ fromJson(steps.issue_data.outputs.result).issue }}
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
           script: |
-            const issue = fromJson(steps.issue_data.outputs.result).issue;
-            const projectData = fromJson(steps.project_status.outputs.result);
+            const issueData = JSON.parse(process.env.ISSUE_DATA);
+            const issue = issueData.issue;
+            const projectData = JSON.parse(process.env.PROJECT_DATA);
             
             if (!projectData.itemId || !projectData.statusFieldId) {
               console.log(`Issue #${issue.number} not properly configured in project`);
@@ -391,3 +401,6 @@ jobs:
             } catch (error) {
               console.error(`Error updating project item: ${error.message}`);
             }
+        env:
+          ISSUE_DATA: ${{ steps.issue_data.outputs.result }}
+          PROJECT_DATA: ${{ steps.project_status.outputs.result }}
