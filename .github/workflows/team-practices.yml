@@ -1,0 +1,114 @@
+name: Team Practices Workflow
+
+# Se dispara en:
+#   - Cuando se actualiza un item del proyecto (Project v2).
+#   - Cuando se cierra una PR (para detectar la fusión).
+on:
+  project_v2_item:
+    types: [updated]
+  pull_request:
+    types: [closed]
+
+jobs:
+  handle_project:
+    name: Procesar cambios en el Project
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'project_v2_item' }}
+    steps:
+      - name: Extraer información del item del project
+        id: info
+        run: |
+          echo "Columna actual: ${{ github.event.project_v2_item.column_name }}"
+          # Se asume que el contenido (content) es una Issue; extraemos número y título.
+          ISSUE_NUMBER="${{ github.event.project_v2_item.content.issue.number }}"
+          ISSUE_TITLE="${{ github.event.project_v2_item.content.issue.title }}"
+          echo "Issue: #${ISSUE_NUMBER} - ${ISSUE_TITLE}"
+          # Extraer el primer label que indica el tipo (se espera: feature, documentation o hotfix).
+          # Nota: podrías mejorar esta lógica recorriendo todos los labels.
+          ISSUE_LABELS='${{ toJson(github.event.project_v2_item.content.issue.labels) }}'
+          TYPE=$(echo $ISSUE_LABELS | jq -r '.[0].name')
+          echo "Tipo detectado: $TYPE"
+          # Generar un "slug" del título (todo en minúsculas, espacios a guiones y sin caracteres especiales)
+          SLUG=$(echo "${ISSUE_TITLE}" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g' | sed 's/[^a-z0-9-]//g')
+          BRANCH_NAME="${TYPE}/${ISSUE_NUMBER}-${SLUG}"
+          echo "::set-output name=branch::${BRANCH_NAME}"
+          echo "::set-output name=issue_number::${ISSUE_NUMBER}"
+          echo "::set-output name=column::${{ github.event.project_v2_item.column_name }}"
+      - name: Crear branch al mover la issue a "In Progress"
+        if: ${{ steps.info.outputs.column == 'In Progress' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          BRANCH_NAME=${{ steps.info.outputs.branch }}
+          echo "Creando la branch '$BRANCH_NAME' para la issue #${{ steps.info.outputs.issue_number }}"
+          # Obtener el SHA del branch por defecto
+          DEFAULT_BRANCH=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            https://api.github.com/repos/${{ github.repository }} | jq -r '.default_branch')
+          DEFAULT_SHA=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            https://api.github.com/repos/${{ github.repository }}/git/refs/heads/${DEFAULT_BRANCH} | jq -r '.object.sha')
+          echo "Branch por defecto: $DEFAULT_BRANCH (SHA: $DEFAULT_SHA)"
+          # Crear la nueva branch usando la API REST de GitHub
+          curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+            -d "{\"ref\": \"refs/heads/${BRANCH_NAME}\", \"sha\": \"${DEFAULT_SHA}\"}" \
+            https://api.github.com/repos/${{ github.repository }}/git/refs
+      - name: Crear Pull Request al mover la issue a "In Review"
+        if: ${{ steps.info.outputs.column == 'In Review' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          ISSUE_NUMBER=${{ steps.info.outputs.issue_number }}
+          BRANCH_NAME=${{ steps.info.outputs.branch }}
+          # Se vuelve a obtener el branch por defecto
+          DEFAULT_BRANCH=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            https://api.github.com/repos/${{ github.repository }} | jq -r '.default_branch')
+          echo "Creando PR de '$BRANCH_NAME' contra '$DEFAULT_BRANCH'"
+          curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+            -d "{
+                  \"title\": \"PR para Issue #${ISSUE_NUMBER}: ${BRANCH_NAME}\",
+                  \"head\": \"${BRANCH_NAME}\",
+                  \"base\": \"${DEFAULT_BRANCH}\",
+                  \"body\": \"Vincula la issue #${ISSUE_NUMBER}\"
+                }" \
+            https://api.github.com/repos/${{ github.repository }}/pulls
+
+  handle_pr:
+    name: Actualizar Issue a "Done" al fusionar la PR
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.merged == true }}
+    steps:
+      - name: Extraer issue vinculada desde el cuerpo de la PR
+        id: prinfo
+        run: |
+          # Se asume que en la descripción de la PR se menciona "#<numero>" para vincular la issue.
+          ISSUE_NUMBER=$(echo "${{ github.event.pull_request.body }}" | grep -o "#[0-9]*" | head -n1 | tr -d '#')
+          if [ -z "$ISSUE_NUMBER" ]; then
+            echo "No se encontró el número de issue en la descripción."
+            exit 1
+          fi
+          echo "::set-output name=issue_number::${ISSUE_NUMBER}"
+      - name: Mover Issue a "Done"
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          ISSUE_NUMBER=${{ steps.prinfo.outputs.issue_number }}
+          echo "Actualizando la issue #${ISSUE_NUMBER} a la columna 'Done'"
+          # Esta mutación GraphQL es un ejemplo; deberás reemplazar <project_id>, <item_id> y <done_option_id>
+          # por los valores reales de tu proyecto.
+          read -r -d '' QUERY <<EOF
+          mutation {
+            updateProjectV2Item(input: {
+              projectId: "<project_id>",
+              itemId: "<item_id>",
+              fieldValue: {
+                singleSelectOptionId: "<done_option_id>"
+              }
+            }) {
+              projectV2Item {
+                id
+              }
+            }
+}
+EOF
+curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"query\": \"$QUERY\"}" \
+            https://api.github.com/graphql
