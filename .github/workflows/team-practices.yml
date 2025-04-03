@@ -86,29 +86,17 @@ jobs:
             exit 1
           fi
           echo "::set-output name=issue_number::${ISSUE_NUMBER}"
-      - name: Mover Issue a "Done"
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-        run: |
-          ISSUE_NUMBER=${{ steps.prinfo.outputs.issue_number }}
-          echo "Actualizando la issue #${ISSUE_NUMBER} a la columna 'Done'"
-          # Esta mutación GraphQL es un ejemplo; deberás reemplazar <project_id>, <item_id> y <done_option_id>
-          # por los valores reales de tu proyecto.
-          read -r -d '' QUERY <<EOF
-          mutation {
-            updateProjectV2Item(input: {
-              projectId: "<project_id>",
-              itemId: "<item_id>",
-              fieldValue: {
-                singleSelectOptionId: "<done_option_id>"
-              }
-            }) {
-              projectV2Item {
-                id
-              }
-            }
-}
-EOF
-curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" -H "Content-Type: application/json" \
-            -d "{\"query\": \"$QUERY\"}" \
-            https://api.github.com/graphql
+          - name: Mover Issue a "Done"
+          env:
+            GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          run: |
+            ISSUE_NUMBER=${{ steps.prinfo.outputs.issue_number }}
+            echo "Actualizando la issue #${ISSUE_NUMBER} a la columna 'Done'"
+            
+            QUERY=$(jq -n --arg project "<project_id>" --arg item "<item_id>" --arg done "<done_option_id>" \
+              '{query: "mutation { updateProjectV2Item(input: { projectId: $project, itemId: $item, fieldValue: { singleSelectOptionId: $done } }) { projectV2Item { id } } }"}')
+  
+            curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$QUERY" \
+              https://api.github.com/graphql
