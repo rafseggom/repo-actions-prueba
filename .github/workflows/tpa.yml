@@ -64,6 +64,15 @@ jobs:
               labels: []
             };
 
+      - name: Debug card details
+        if: github.event_name == 'project_card'
+        run: |
+          echo "Event name: ${{ github.event_name }}"
+          echo "Card ID: ${{ github.event.project_card.id }}"
+          echo "Column ID: ${{ github.event.project_card.column_id }}"
+          echo "Column Name: ${{ fromJson(steps.card.outputs.result).columnName }}"
+          echo "Issue Number: ${{ fromJson(steps.card.outputs.result).issueNumber }}"
+          
       # When task moves to "In Progress" column
       - name: Create branch when moved to In Progress
         if: ${{ fromJson(steps.card.outputs.result).columnName == 'In Progress' && fromJson(steps.card.outputs.result).issueNumber != null }}
