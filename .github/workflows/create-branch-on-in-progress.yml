@@ -1,7 +1,7 @@
 name: Create Branch on In Progress
 
 on:
-  projects_v2_item:
+  issues:
     types: [edited]
 
 jobs:
@@ -10,13 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      issues: read
-      projects: write
+      issues: write
     steps:
     - name: Check status change
       id: check_status
       uses: actions/github-script@v6
       with:
+        github-token: ${{ secrets.PAT_TOKEN }}
         script: |
           const { changes, projects_v2_item } = context.payload;
           const statusChange = changes.find(c => 
@@ -25,7 +25,10 @@ jobs:
             c.field_value?.option_name === 'In Progress'
           );
           
-          if (!statusChange) return core.setOutput('trigger', 'false');
+          if (!statusChange) {
+            core.setOutput('trigger', 'false');
+            return;
+          }
           
           if (projects_v2_item.content_type !== 'Issue') {
             core.setOutput('trigger', 'false');
@@ -33,21 +36,29 @@ jobs:
           }
           
           core.setOutput('trigger', 'true');
+          core.setOutput('content_node_id', projects_v2_item.content_node_id);
 
     - name: Get issue info
       if: steps.check_status.outputs.trigger == 'true'
       id: get_issue
       uses: actions/github-script@v6
       with:
+        github-token: ${{ secrets.PAT_TOKEN }}
         script: |
-          const { content_node_id } = context.payload.projects_v2_item;
+          const content_node_id = '${{ steps.check_status.outputs.content_node_id }}';
           const response = await github.graphql(`
             query ($nodeId: ID!) {
               node(id: $nodeId) {
                 ... on Issue {
                   number
                   title
-                  labels {
+                  repository {
+                    owner {
+                      login
+                    }
+                    name
+                  }
+                  labels(first: 20) {
                     nodes {
                       name
                     }
@@ -57,9 +68,12 @@ jobs:
             }
           `, { nodeId: content_node_id });
           
-          core.setOutput('number', response.node.number);
-          core.setOutput('title', response.node.title);
-          core.setOutput('labels', response.node.labels.nodes.map(l => l.name).join(','));
+          const issue = response.node;
+          core.setOutput('number', issue.number);
+          core.setOutput('title', issue.title);
+          core.setOutput('labels', issue.labels.nodes.map(l => l.name).join(','));
+          core.setOutput('repo_owner', issue.repository.owner.login);
+          core.setOutput('repo_name', issue.repository.name);
 
     - name: Determine branch type
       if: steps.check_status.outputs.trigger == 'true'
@@ -67,7 +81,7 @@ jobs:
       run: |
         if [[ "${{ steps.get_issue.outputs.labels }}" == *"documentation"* ]]; then
           echo "type=documentation" >> $GITHUB_OUTPUT
-        elif [[ "${{ steps.get_issue.outputs.labels }}" == *"hotfix"* ]]; then
+        elif [[ "${{ steps.get_issue.outputs.labels }}" == *"bug"* ]] || [[ "${{ steps.get_issue.outputs.labels }}" == *"hotfix"* ]]; then
           echo "type=hotfix" >> $GITHUB_OUTPUT
         else
           echo "type=feature" >> $GITHUB_OUTPUT
@@ -80,10 +94,43 @@ jobs:
         SANITIZED_TITLE=$(echo "${{ steps.get_issue.outputs.title }}" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]/-/g' -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//')
         echo "name=${{ steps.branch_type.outputs.type }}/${{ steps.get_issue.outputs.number }}-${SANITIZED_TITLE}" >> $GITHUB_OUTPUT
 
+    - name: Checkout repository
+      if: steps.check_status.outputs.trigger == 'true'
+      uses: actions/checkout@v3
+      with:
+        token: ${{ secrets.PAT_TOKEN }}
+
     - name: Create branch
       if: steps.check_status.outputs.trigger == 'true'
-      uses: peterjgrainger/action-create-branch@v2
+      id: create_branch
+      uses: peterjgrainger/action-create-branch@v3
       env:
         GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
       with:
         branch: ${{ steps.branch_name.outputs.name }}
+
+    - name: Notify issue about branch creation
+      if: steps.check_status.outputs.trigger == 'true'
+      uses: actions/github-script@v6
+      with:
+        github-token: ${{ secrets.PAT_TOKEN }}
+        script: |
+          const issueNumber = ${{ steps.get_issue.outputs.number }};
+          const branchName = '${{ steps.branch_name.outputs.name }}';
+          const repoOwner = '${{ steps.get_issue.outputs.repo_owner }}';
+          const repoName = '${{ steps.get_issue.outputs.repo_name }}';
+          
+          // Create a link to the branch
+          const branchUrl = `https://github.com/${repoOwner}/${repoName}/tree/${branchName}`;
+          
+          try {
+            await github.rest.issues.createComment({
+              owner: repoOwner,
+              repo: repoName,
+              issue_number: issueNumber,
+              body: `🔨 Branch \`${branchName}\` has been created for this issue.\n\n[View branch](${branchUrl})`
+            });
+            console.log(`Added comment to issue #${issueNumber} about branch creation`);
+          } catch (error) {
+            core.setFailed(`Failed to comment on issue: ${error.message}`);
+          }
