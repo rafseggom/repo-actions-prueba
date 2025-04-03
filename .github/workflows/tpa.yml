@@ -1,347 +1,223 @@
 name: Team Practices Automation
 
 on:
-  issues:
-    types: [labeled, unlabeled]
+  project_card:
+    types: [created, moved]
   pull_request:
-    types: [opened, closed]
-  # Para GitHub Projects (V2)
-  project_v2_item:
-    types: [edited]
+    types: [closed]
 
 jobs:
-  debug-project-event:
+  handle_issue_movement:
     runs-on: ubuntu-latest
-    if: github.event_name == 'project_v2_item'
+    if: github.event_name == 'project_card'
     steps:
-      - name: Debug Project V2 Item Event
-        run: |
-          echo "Project event triggered"
-          echo "Event name: ${{ github.event_name }}"
-          echo "Event action: ${{ github.event.action }}"
-          echo "Project V2 Item Node ID: ${{ github.event.project_v2_item.node_id }}"
-          echo "Changes: ${{ toJSON(github.event.changes) }}"
-          
-          # Si hubo cambios en el campo status
-          if [[ "${{ toJSON(github.event.changes) }}" == *"field_value"* ]]; then
-            echo "Field Node ID: ${{ github.event.changes.field_value.field_node_id }}"
-            echo "Previous value: ${{ github.event.changes.field_value.before }}"
-            echo "Current value: ${{ github.event.changes.field_value.after }}"
-          fi
-
-  create-branch-on-in-progress:
-    runs-on: ubuntu-latest
-    # Modificamos la condición para aceptar cualquier cambio de status mientras debugging
-    if: |
-      (github.event_name == 'issues' && (contains(github.event.issue.labels.*.name, 'In Progress') || contains(github.event.issue.labels.*.name, 'in-progress'))) ||
-      (github.event_name == 'project_v2_item' && contains(toJSON(github.event.changes), 'field_value'))
-    steps:
-      - name: Debug event data
-        if: github.event_name == 'project_v2_item'
-        run: |
-          echo "Processing project item event"
-          echo "Changes: ${{ toJSON(github.event.changes) }}"
-          
-          # Extract field_node_id for reference
-          if [[ "${{ toJSON(github.event.changes) }}" == *"field_value"* ]]; then
-            echo "Field Node ID: ${{ github.event.changes.field_value.field_node_id }}"
-            echo "Current value: ${{ github.event.changes.field_value.after }}"
-            
-            # Save field ID for future reference
-            echo "STATUS_FIELD_ID=${{ github.event.changes.field_value.field_node_id }}" >> $GITHUB_ENV
-            
-            # Check if the new status is "In Progress"
-            if [[ "${{ github.event.changes.field_value.after }}" == "In Progress" ]]; then
-              echo "Item moved to In Progress status"
-              echo "SHOULD_PROCESS=true" >> $GITHUB_ENV
-            else
-              echo "Item not moved to In Progress (current status: ${{ github.event.changes.field_value.after }})"
-              echo "SHOULD_PROCESS=false" >> $GITHUB_ENV
-            fi
-          else
-            echo "No field_value changes found"
-            echo "SHOULD_PROCESS=false" >> $GITHUB_ENV
-          fi
-
-      - name: Get issue from project item (if project event)
-        if: github.event_name == 'project_v2_item' && env.SHOULD_PROCESS != 'false'
-        id: get-issue
-        run: |
-          # Usamos GraphQL para obtener la issue relacionada con el project item
-          ISSUE_ID=$(gh api graphql -f query='
-            query($nodeId:ID!) {
-              node(id: $nodeId) {
-                ... on ProjectV2Item {
-                  content {
-                    ... on Issue {
-                      number
-                      title
-                    }
-                  }
-                }
-              }
-            }' -f nodeId="${{ github.event.project_v2_item.node_id }}" --jq '.data.node.content.number')
-          
-          if [ -n "$ISSUE_ID" ]; then
-            echo "ISSUE_NUMBER=$ISSUE_ID" >> $GITHUB_ENV
-            echo "PROJECT_EVENT=true" >> $GITHUB_ENV
-            echo "Found issue #$ISSUE_ID for this project item"
-          else
-            echo "No issue found for this project item"
-            exit 1
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN }}
 
-      - name: Extract issue number and create branch
-        run: |
-          # Si venimos de un evento project_v2_item, ya tenemos el ISSUE_NUMBER en env
-          # Si no, tomamos el del evento de issue
-          if [ -z "${{ env.ISSUE_NUMBER }}" ]; then
-            ISSUE_NUMBER=${{ github.event.issue.number }}
-          else
-            ISSUE_NUMBER=${{ env.ISSUE_NUMBER }}
-          fi
-          
-          # Obtener el título de la issue
-          ISSUE_TITLE=$(gh issue view $ISSUE_NUMBER --json title -q '.title')
-          
-          echo "Working with issue #$ISSUE_NUMBER: $ISSUE_TITLE"
-          
-          # Verificar si es un hotfix
-          IS_HOTFIX=$(gh issue view $ISSUE_NUMBER --json labels -q '.labels[] | select(.name=="Hotfix" or .name=="hotfix") | .name')
-          
-          # Sanitizar el título para un nombre de rama válido
-          BRANCH_TITLE=$(echo "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-zA-Z0-9]/-/g' | sed 's/--/-/g' | sed 's/^-//' | sed 's/-$//')
-          
-          # Crear la rama con convención GitFlow
-          if [ -n "$IS_HOTFIX" ]; then
-            BRANCH_NAME="hotfix/$ISSUE_NUMBER-$BRANCH_TITLE"
-            BASE_BRANCH="main"
-          else
-            BRANCH_NAME="feature/$ISSUE_NUMBER-$BRANCH_TITLE"
-            BASE_BRANCH="develop"
-          fi
-          
-          # Verificar si la rama ya existe
-          if git ls-remote --heads origin $BRANCH_NAME | grep -q $BRANCH_NAME; then
-            echo "Branch $BRANCH_NAME already exists."
-            exit 0
-          fi
-          
-          # Crear la rama
-          git config --global user.name "GitHub Actions Bot"
-          git config --global user.email "actions@github.com"
-          git checkout $BASE_BRANCH
-          git pull origin $BASE_BRANCH
-          git checkout -b $BRANCH_NAME
-          git push origin $BRANCH_NAME
-          
-          # Guardar información para el siguiente paso
-          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
-          echo "IS_HOTFIX=$IS_HOTFIX" >> $GITHUB_ENV
-          echo "BASE_BRANCH=$BASE_BRANCH" >> $GITHUB_ENV
-          echo "ISSUE_NUMBER=$ISSUE_NUMBER" >> $GITHUB_ENV
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-
-      - name: Link issue to branch
-        run: |
-          # Comentar en la issue con la información de la rama
-          if [ -n "${{ env.IS_HOTFIX }}" ]; then
-            gh issue comment ${{ env.ISSUE_NUMBER }} --body "Hotfix branch [${{ env.BRANCH_NAME }}](https://github.com/${{ github.repository }}/tree/${{ env.BRANCH_NAME }}) has been created from ${{ env.BASE_BRANCH }} for this issue."
-          else
-            gh issue comment ${{ env.ISSUE_NUMBER }} --body "Feature branch [${{ env.BRANCH_NAME }}](https://github.com/${{ github.repository }}/tree/${{ env.BRANCH_NAME }}) has been created for this issue."
-          fi
-          
-          # Vincular issue y rama en la UI de GitHub
-          gh issue develop ${{ env.ISSUE_NUMBER }} --name ${{ env.BRANCH_NAME }} --repo ${{ github.repository }}
-          
-          # Asegurar que la issue tiene la etiqueta In Progress para consistencia
-          gh issue edit ${{ env.ISSUE_NUMBER }} --add-label "In Progress"
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-
-  create-pr-on-in-review:
-    runs-on: ubuntu-latest
-    if: |
-      (github.event_name == 'issues' && (contains(github.event.issue.labels.*.name, 'In Review') || contains(github.event.issue.labels.*.name, 'in-review'))) ||
-      (github.event_name == 'project_v2_item' && contains(toJSON(github.event.changes), 'field_value') && github.event.changes.field_value.after == 'In Review')
-    steps:
-      - name: Get issue from project item (if project event)
-        if: github.event_name == 'project_v2_item'
-        id: get-issue
-        run: |
-          # Usamos GraphQL para obtener la issue relacionada con el project item
-          ISSUE_ID=$(gh api graphql -f query='
-            query($nodeId:ID!) {
-              node(id: $nodeId) {
-                ... on ProjectV2Item {
-                  content {
-                    ... on Issue {
-                      number
-                    }
-                  }
-                }
-              }
-            }' -f nodeId="${{ github.event.project_v2_item.node_id }}" --jq '.data.node.content.number')
-          
-          if [ -n "$ISSUE_ID" ]; then
-            echo "ISSUE_NUMBER=$ISSUE_ID" >> $GITHUB_ENV
-            echo "PROJECT_EVENT=true" >> $GITHUB_ENV
-          else
-            echo "No issue found for this project item"
-            exit 1
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - name: Get card details
+        id: card
+        uses: actions/github-script@v6
         with:
-          fetch-depth: 0
-          token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const card = await github.rest.projects.getCard({
+              card_id: context.payload.project_card.id
+            });
+            
+            // Get the column name
+            const column = await github.rest.projects.getColumn({
+              column_id: context.payload.project_card.column_id
+            });
+            const columnName = column.data.name;
+            console.log('Column name:', columnName);
+            
+            // Extract issue data if content_url exists
+            if (card.data.content_url) {
+              const issueUrl = card.data.content_url;
+              const issueMatch = issueUrl.match(/\/issues\/(\d+)$/);
+              if (issueMatch) {
+                const issueNumber = issueMatch[1];
+                
+                // Get issue details
+                const issue = await github.rest.issues.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: parseInt(issueNumber)
+                });
+                const issueTitle = issue.data.title;
+                
+                return {
+                  columnName: columnName,
+                  issueNumber: issueNumber,
+                  issueTitle: issueTitle,
+                  labels: issue.data.labels
+                };
+              }
+            }
+            
+            return {
+              columnName: columnName,
+              issueNumber: null,
+              issueTitle: null,
+              labels: []
+            };
 
-      - name: Create pull request if not exists
+      # When task moves to "In Progress" column
+      - name: Create branch when moved to In Progress
+        if: ${{ fromJson(steps.card.outputs.result).columnName == 'In Progress' && fromJson(steps.card.outputs.result).issueNumber != null }}
         run: |
-          # Determinar el número de la issue
-          if [ -z "${{ env.ISSUE_NUMBER }}" ]; then
-            ISSUE_NUMBER=${{ github.event.issue.number }}
-          else
-            ISSUE_NUMBER=${{ env.ISSUE_NUMBER }}
+          ISSUE_NUMBER="${{ fromJson(steps.card.outputs.result).issueNumber }}"
+          ISSUE_TITLE="${{ fromJson(steps.card.outputs.result).issueTitle }}"
+          
+          # Sanitize title for branch name
+          SANITIZED_TITLE=$(echo "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-zA-Z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+          
+          # Default type is feature
+          BRANCH_TYPE="feature"
+          
+          # Determine branch type based on labels
+          LABELS=$(curl -s -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+                 "https://api.github.com/repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/labels" | jq -r '.[].name')
+          
+          if echo "$LABELS" | grep -q "documentation"; then
+            BRANCH_TYPE="documentation"
+          elif echo "$LABELS" | grep -q "bug" || echo "$LABELS" | grep -q "hotfix"; then
+            BRANCH_TYPE="hotfix"
           fi
           
-          # Determine if this is a hotfix
-          IS_HOTFIX=$(gh issue view $ISSUE_NUMBER --json labels -q '.labels[] | select(.name=="Hotfix" or .name=="hotfix") | .name')
+          # Create and push branch
+          BRANCH_NAME="${BRANCH_TYPE}/${ISSUE_NUMBER}-${SANITIZED_TITLE}"
           
-          # Find branch related to this issue
-          if [ -n "$IS_HOTFIX" ]; then
-            BRANCH_PATTERN="hotfix/$ISSUE_NUMBER-"
-            MAIN_TARGET="main"
-            SECONDARY_TARGET="develop"
-          else
-            BRANCH_PATTERN="feature/$ISSUE_NUMBER-"
-            MAIN_TARGET="develop"
-            SECONDARY_TARGET=""
-          fi
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git checkout -b "$BRANCH_NAME" 
+          git push origin "$BRANCH_NAME"
           
-          BRANCH_NAME=$(git ls-remote --heads origin | grep "refs/heads/$BRANCH_PATTERN" | head -n 1 | awk -F'refs/heads/' '{print $2}')
+          echo "Created branch: $BRANCH_NAME"
           
-          if [ -z "$BRANCH_NAME" ]; then
-            echo "No branch found for issue #$ISSUE_NUMBER"
-            exit 1
-          fi
-          
-          # Get issue title for PR title
-          ISSUE_TITLE=$(gh issue view $ISSUE_NUMBER --json title -q '.title')
-          
-          # Check if a PR already exists to main target
-          MAIN_PR_EXISTS=$(gh pr list --head $BRANCH_NAME --base $MAIN_TARGET --json number | jq '.[].number')
-          
-          if [ -z "$MAIN_PR_EXISTS" ]; then
-            # Create main pull request
-            MAIN_PR_NUMBER=$(gh pr create --base $MAIN_TARGET --head $BRANCH_NAME --title "$ISSUE_TITLE" --body "Closes #$ISSUE_NUMBER" --json number -q '.number')
-            echo "Pull request #$MAIN_PR_NUMBER created for branch $BRANCH_NAME to $MAIN_TARGET"
+          # Add comment to issue with branch info
+          curl -s -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -d "{\"body\": \"🔨 Branch \`$BRANCH_NAME\` was automatically created for this issue.\"}" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/comments"
+
+      # When task moves to "In Review" column
+      - name: Create PR when moved to In Review
+        if: ${{ fromJson(steps.card.outputs.result).columnName == 'In Review' && fromJson(steps.card.outputs.result).issueNumber != null }}
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const issueNumber = ${{ fromJson(steps.card.outputs.result).issueNumber }};
+            const issueTitle = '${{ fromJson(steps.card.outputs.result).issueTitle }}';
             
-            # Add comment to issue about the PR
-            gh issue comment $ISSUE_NUMBER --body "Pull Request [#$MAIN_PR_NUMBER](https://github.com/${{ github.repository }}/pull/$MAIN_PR_NUMBER) has been created to $MAIN_TARGET."
-          else
-            echo "Pull request to $MAIN_TARGET already exists (#$MAIN_PR_EXISTS)"
-          fi
-          
-          # For hotfixes, create a second PR to the secondary target if needed
-          if [ -n "$IS_HOTFIX" ] && [ -n "$SECONDARY_TARGET" ]; then
-            SECONDARY_PR_EXISTS=$(gh pr list --head $BRANCH_NAME --base $SECONDARY_TARGET --json number | jq '.[].number')
+            // List branches that might be related to this issue
+            const { data: branches } = await github.rest.repos.listBranches({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
             
-            if [ -z "$SECONDARY_PR_EXISTS" ]; then
-              # Create secondary pull request
-              SECONDARY_PR_NUMBER=$(gh pr create --base $SECONDARY_TARGET --head $BRANCH_NAME --title "$ISSUE_TITLE (backport to $SECONDARY_TARGET)" --body "Closes #$ISSUE_NUMBER\n\n*This is a backport of the hotfix to $SECONDARY_TARGET.*" --json number -q '.number')
-              echo "Pull request #$SECONDARY_PR_NUMBER created for branch $BRANCH_NAME to $SECONDARY_TARGET"
+            // Look for branch with issue number in name
+            const issueBranch = branches.find(branch => branch.name.includes(`/${issueNumber}-`));
+            
+            if (!issueBranch) {
+              console.log(`No branch found for issue #${issueNumber}`);
+              return;
+            }
+            
+            // Create PR
+            try {
+              const { data: pr } = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: issueTitle,
+                body: `Resolves #${issueNumber}`,
+                head: issueBranch.name,
+                base: 'main'
+              });
               
-              # Add comment to issue about the secondary PR
-              gh issue comment $ISSUE_NUMBER --body "Additional Pull Request [#$SECONDARY_PR_NUMBER](https://github.com/${{ github.repository }}/pull/$SECONDARY_PR_NUMBER) has been created to $SECONDARY_TARGET."
-            else
-              echo "Pull request to $SECONDARY_TARGET already exists (#$SECONDARY_PR_EXISTS)"
-            fi
-          fi
-          
-          # Remove 'In Progress' label and add 'In Review' label
-          gh issue edit $ISSUE_NUMBER --remove-label "In Progress" --add-label "In Review"
-          gh issue comment $ISSUE_NUMBER --body "Issue has been moved to In Review."
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+              console.log(`Created PR #${pr.number} for issue #${issueNumber}`);
+              
+              // Add comment on the issue
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: `📝 Pull request [#${pr.number}](${pr.html_url}) has been created for this issue.`
+              });
+            } catch (error) {
+              console.error(`Error creating PR: ${error.message}`);
+            }
 
-  move-to-done-on-pr-merge:
+  handle_pr_merged:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
     steps:
-      - name: Extract issue number from PR body
-        id: extract_issue
-        run: |
-          PR_BODY="${{ github.event.pull_request.body }}"
-          ISSUE_NUMBER=$(echo "$PR_BODY" | grep -o '#[0-9]\+' | head -n 1 | tr -d '#')
-          
-          if [ -z "$ISSUE_NUMBER" ];then
-            echo "No issue number found in PR body"
-            exit 0
-          fi
-          
-          echo "ISSUE_NUMBER=$ISSUE_NUMBER" >> $GITHUB_ENV
-          
-          # Determine if this is a hotfix
-          IS_HOTFIX=$(gh issue view $ISSUE_NUMBER --json labels -q '.labels[] | select(.name=="Hotfix" or .name=="hotfix") | .name')
-          if [ -n "$IS_HOTFIX" ]; then
-            echo "IS_HOTFIX=true" >> $GITHUB_ENV
-          else
-            echo "IS_HOTFIX=false" >> $GITHUB_ENV
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-
-      - name: Check remaining PRs for hotfixes
-        if: env.ISSUE_NUMBER != '' && env.IS_HOTFIX == 'true'
-        run: |
-          # Find the branch name from current PR
-          BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
-          
-          # Check if there are any open PRs for this branch
-          OPEN_PRS=$(gh pr list --head $BRANCH_NAME --state open --json number | jq 'length')
-          
-          if [ "$OPEN_PRS" -eq 0 ]; then
-            # All PRs are merged or closed, move to Done
-            gh issue edit ${{ env.ISSUE_NUMBER }} --remove-label "In Review" --add-label "Done"
-            gh issue comment ${{ env.ISSUE_NUMBER }} --body "All pull requests for this hotfix have been merged. Moving to Done."
+      - name: Move issue to Done when PR is merged
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            // Extract issue number from PR body
+            const prBody = context.payload.pull_request.body;
+            const matches = prBody.match(/[Rr]esolves #(\d+)/);
             
-            # Move item to Done in project board
-            if [ -n "${{ github.event.project_v2_item.project_node_id }}" ]; then
-              # Si tuviéramos el ID del proyecto y del status field, podríamos moverlo también aquí...
-              echo "Would move the issue to Done in the project board if we had project info"
-            fi
-          else
-            gh issue comment ${{ env.ISSUE_NUMBER }} --body "Pull request to ${{ github.event.pull_request.base.ref }} has been merged. Waiting for remaining PRs to be merged before moving to Done."
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-
-      - name: Move issue to Done (for features)
-        if: env.ISSUE_NUMBER != '' && env.IS_HOTFIX == 'false'
-        run: |
-          # Remove 'In Review' label and add 'Done' label
-          gh issue edit ${{ env.ISSUE_NUMBER }} --remove-label "In Review" --add-label "Done"
-          
-          # Comment on the issue
-          gh issue comment ${{ env.ISSUE_NUMBER }} --body "This issue has been completed and the pull request has been merged. Moving to Done."
-          
-          # Move item to Done in project board
-          if [ -n "${{ github.event.project_v2_item.project_node_id }}" ]; then
-            # Si tuviéramos el ID del proyecto y del status field, podríamos moverlo también aquí...
-            echo "Would move the issue to Done in the project board if we had project info"
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+            if (!matches) {
+              console.log('No linked issue found in PR body');
+              return;
+            }
+            
+            const issueNumber = matches[1];
+            console.log(`Found linked issue: #${issueNumber}`);
+            
+            // Get project columns
+            const { data: projects } = await github.rest.projects.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open'
+            });
+            
+            if (projects.length === 0) {
+              console.log('No projects found');
+              return;
+            }
+            
+            // Find the Done column in the project
+            for (const project of projects) {
+              const { data: columns } = await github.rest.projects.listColumns({
+                project_id: project.id
+              });
+              
+              const doneColumn = columns.find(column => column.name === 'Done');
+              if (!doneColumn) {
+                console.log(`No 'Done' column found in project ${project.name}`);
+                continue;
+              }
+              
+              // Find the card for this issue
+              let issueCards = [];
+              for (const column of columns) {
+                const { data: cards } = await github.rest.projects.listCards({
+                  column_id: column.id
+                });
+                
+                for (const card of cards) {
+                  if (card.content_url && card.content_url.includes(`/issues/${issueNumber}`)) {
+                    issueCards.push({ card, columnId: column.id });
+                  }
+                }
+              }
+              
+              // Move the card to the Done column
+              for (const {card, columnId} of issueCards) {
+                if (columnId !== doneColumn.id) {
+                  await github.rest.projects.moveCard({
+                    card_id: card.id,
+                    position: 'top',
+                    column_id: doneColumn.id
+                  });
+                  console.log(`Moved issue #${issueNumber} to Done column in project ${project.name}`);
+                }
+              }
+            }
