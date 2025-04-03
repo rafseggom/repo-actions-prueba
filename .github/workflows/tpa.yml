@@ -1,15 +1,36 @@
-name: Team Practices Automation
+name: Team Project Automation (Projects v2)
 
+# Este workflow funciona con GitHub Projects v2
 on:
-  project_card:
-    types: [created, moved]
+  issues:
+    types: [opened, edited, labeled, unlabeled]
   pull_request:
-    types: [closed]
+    types: [opened, closed]
+  # Permite ejecutar manualmente para pruebas
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to process'
+        required: true
+      action:
+        description: 'Action to perform (branch_creation, pr_creation)'
+        required: true
+
+env:
+  # Configuración de tu proyecto
+  PROJECT_OWNER_TYPE: "users" 
+  PROJECT_OWNER: "rafseggom"
+  PROJECT_NUMBER: 2
+  STATUS_FIELD_NAME: "Status"
+  TODO_STATUS: "Todo"
+  IN_PROGRESS_STATUS: "In Progress"
+  IN_REVIEW_STATUS: "In Review"
+  DONE_STATUS: "Done"
+  BASE_BRANCH: "develop"  # Rama base actualizada a 'develop'
 
 jobs:
-  handle_issue_movement:
+  process_project_item:
     runs-on: ubuntu-latest
-    if: github.event_name == 'project_card'
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -17,78 +38,209 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.PAT_TOKEN }}
 
-      - name: Get card details
-        id: card
+      - name: Get issue status from event
+        id: issue_data
         uses: actions/github-script@v6
         with:
+          github-token: ${{ secrets.PAT_TOKEN }}
           script: |
-            const card = await github.rest.projects.getCard({
-              card_id: context.payload.project_card.id
-            });
+            let issueNumber;
+            let processType;
             
-            // Get the column name
-            const column = await github.rest.projects.getColumn({
-              column_id: context.payload.project_card.column_id
-            });
-            const columnName = column.data.name;
-            console.log('Column name:', columnName);
+            // Determinar qué tipo de evento y obtener el número de issue
+            if (context.eventName === 'workflow_dispatch') {
+              // Evento manual
+              issueNumber = context.payload.inputs.issue_number;
+              processType = context.payload.inputs.action;
+              console.log(`Manual trigger for issue #${issueNumber}, action: ${processType}`);
+            } 
+            else if (context.eventName === 'issues') {
+              // Evento de issue
+              issueNumber = context.payload.issue.number;
+              processType = 'check_status';
+              console.log(`Issue event for #${issueNumber}`);
+            }
+            else if (context.eventName === 'pull_request') {
+              // Evento de PR
+              const prBody = context.payload.pull_request.body || '';
+              const matches = prBody.match(/[Rr]esolves #(\d+)/);
+              if (matches) {
+                issueNumber = matches[1];
+                processType = context.payload.pull_request.merged ? 'pr_merged' : 'pr_opened';
+                console.log(`PR event for issue #${issueNumber}, merged: ${context.payload.pull_request.merged}`);
+              } else {
+                console.log('No linked issue found in PR body');
+                return {issue: null, process: null};
+              }
+            }
             
-            // Extract issue data if content_url exists
-            if (card.data.content_url) {
-              const issueUrl = card.data.content_url;
-              const issueMatch = issueUrl.match(/\/issues\/(\d+)$/);
-              if (issueMatch) {
-                const issueNumber = issueMatch[1];
-                
-                // Get issue details
-                const issue = await github.rest.issues.get({
+            if (issueNumber) {
+              try {
+                // Obtener los detalles de la issue
+                const { data: issue } = await github.rest.issues.get({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: parseInt(issueNumber)
                 });
-                const issueTitle = issue.data.title;
+                
+                console.log(`Issue title: ${issue.title}`);
                 
                 return {
-                  columnName: columnName,
-                  issueNumber: issueNumber,
-                  issueTitle: issueTitle,
-                  labels: issue.data.labels
+                  issue: {
+                    number: issueNumber,
+                    title: issue.title,
+                    labels: issue.labels.map(l => l.name)
+                  },
+                  process: processType
                 };
+              } catch (error) {
+                console.error(`Error getting issue #${issueNumber}: ${error.message}`);
+                return {issue: null, process: null};
               }
             }
             
-            return {
-              columnName: columnName,
-              issueNumber: null,
-              issueTitle: null,
-              labels: []
-            };
+            return {issue: null, process: null};
 
-      - name: Debug card details
-        if: github.event_name == 'project_card'
+      - name: Get issue status in project
+        if: fromJson(steps.issue_data.outputs.result).issue
+        id: project_status
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.PAT_TOKEN }}
+          script: |
+            const issue = fromJson(steps.issue_data.outputs.result).issue;
+            if (!issue) return {status: null};
+            
+            const ownerType = process.env.PROJECT_OWNER_TYPE;
+            const owner = process.env.PROJECT_OWNER;
+            const projectNumber = parseInt(process.env.PROJECT_NUMBER);
+            const statusFieldName = process.env.STATUS_FIELD_NAME;
+            
+            // Consulta para obtener el ID del proyecto y los campos
+            const projectQuery = `
+            query($owner: String!, $projectNumber: Int!) {
+              ${ownerType === 'users' ? 'user(login: $owner)' : 'organization(login: $owner)'} {
+                projectV2(number: $projectNumber) {
+                  id
+                  fields(first: 20) {
+                    nodes {
+                      ... on ProjectV2Field {
+                        id
+                        name
+                      }
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        name
+                        options {
+                          id
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }`;
+            
+            try {
+              // Obtener el proyecto y sus campos
+              const projectData = await github.graphql(projectQuery, {
+                owner: owner,
+                projectNumber: projectNumber
+              });
+              
+              const projectPath = ownerType === 'users' ? projectData.user.projectV2 : projectData.organization.projectV2;
+              const projectId = projectPath.id;
+              
+              // Encontrar el campo de estado y sus opciones
+              const statusField = projectPath.fields.nodes.find(field => field.name === statusFieldName);
+              if (!statusField) {
+                console.log(`Status field "${statusFieldName}" not found in project`);
+                return {status: null, projectId: projectId};
+              }
+              
+              // Consulta para encontrar el item de la issue en el proyecto
+              const itemQuery = `
+              query($projectId: ID!, $issueNumber: Int!, $owner: String!, $repo: String!) {
+                node(id: $projectId) {
+                  ... on ProjectV2 {
+                    items(first: 1, filter: {filterBy: {field: CONTENT, operator: EQUAL, value: "repo:${owner}/${repo} issue:${issueNumber}"}}) {
+                      nodes {
+                        id
+                        fieldValues(first: 20) {
+                          nodes {
+                            ... on ProjectV2ItemFieldSingleSelectValue {
+                              name
+                              field {
+                                ... on ProjectV2SingleSelectField {
+                                  name
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+              
+              // Buscar la issue en el proyecto
+              const issueInProject = await github.graphql(itemQuery, {
+                projectId: projectId,
+                issueNumber: parseInt(issue.number),
+                owner: context.repo.owner,
+                repo: context.repo.repo
+              });
+              
+              // Verificar si la issue está en el proyecto
+              const items = issueInProject.node.items.nodes;
+              if (items.length === 0) {
+                console.log(`Issue #${issue.number} not found in project`);
+                return {status: null, projectId: projectId, statusFieldId: statusField.id};
+              }
+              
+              // Obtener el estado actual
+              const itemId = items[0].id;
+              let currentStatus = null;
+              
+              items[0].fieldValues.nodes.forEach(fieldValue => {
+                if (fieldValue.field && fieldValue.field.name === statusFieldName) {
+                  currentStatus = fieldValue.name;
+                }
+              });
+              
+              console.log(`Issue #${issue.number} status in project: ${currentStatus || "Not set"}`);
+              
+              return {
+                status: currentStatus,
+                projectId: projectId,
+                itemId: itemId,
+                statusFieldId: statusField.id,
+                statusOptions: statusField.options || []
+              };
+            } catch (error) {
+              console.error(`Error querying project: ${error.message}`);
+              return {status: null};
+            }
+
+      - name: Create branch for issue (In Progress)
+        if: |
+          fromJson(steps.issue_data.outputs.result).issue && 
+          (fromJson(steps.project_status.outputs.result).status == env.IN_PROGRESS_STATUS || 
+           (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'branch_creation'))
         run: |
-          echo "Event name: ${{ github.event_name }}"
-          echo "Card ID: ${{ github.event.project_card.id }}"
-          echo "Column ID: ${{ github.event.project_card.column_id }}"
-          echo "Column Name: ${{ fromJson(steps.card.outputs.result).columnName }}"
-          echo "Issue Number: ${{ fromJson(steps.card.outputs.result).issueNumber }}"
+          ISSUE_NUMBER="${{ fromJson(steps.issue_data.outputs.result).issue.number }}"
+          ISSUE_TITLE="${{ fromJson(steps.issue_data.outputs.result).issue.title }}"
           
-      # When task moves to "In Progress" column
-      - name: Create branch when moved to In Progress
-        if: ${{ fromJson(steps.card.outputs.result).columnName == 'In Progress' && fromJson(steps.card.outputs.result).issueNumber != null }}
-        run: |
-          ISSUE_NUMBER="${{ fromJson(steps.card.outputs.result).issueNumber }}"
-          ISSUE_TITLE="${{ fromJson(steps.card.outputs.result).issueTitle }}"
-          
-          # Sanitize title for branch name
+          # Sanitizar título para nombre de rama
           SANITIZED_TITLE=$(echo "$ISSUE_TITLE" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-zA-Z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
           
-          # Default type is feature
+          # Tipo de rama predeterminado
           BRANCH_TYPE="feature"
           
-          # Determine branch type based on labels
-          LABELS=$(curl -s -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
-                 "https://api.github.com/repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/labels" | jq -r '.[].name')
+          # Determinar tipo de rama basado en etiquetas
+          LABELS="${{ join(fromJson(steps.issue_data.outputs.result).issue.labels, ' ') }}"
           
           if echo "$LABELS" | grep -q "documentation"; then
             BRANCH_TYPE="documentation"
@@ -96,38 +248,46 @@ jobs:
             BRANCH_TYPE="hotfix"
           fi
           
-          # Create and push branch
+          # Crear y subir rama
           BRANCH_NAME="${BRANCH_TYPE}/${ISSUE_NUMBER}-${SANITIZED_TITLE}"
           
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git checkout -b "$BRANCH_NAME" 
-          git push origin "$BRANCH_NAME"
-          
-          echo "Created branch: $BRANCH_NAME"
-          
-          # Add comment to issue with branch info
-          curl -s -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
-            -d "{\"body\": \"🔨 Branch \`$BRANCH_NAME\` was automatically created for this issue.\"}" \
-            "https://api.github.com/repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/comments"
+          # Verificar si la rama ya existe
+          if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+            echo "Branch $BRANCH_NAME already exists"
+          else
+            git config user.name "GitHub Actions"
+            git config user.email "actions@github.com"
+            git checkout -b "$BRANCH_NAME" 
+            git push origin "$BRANCH_NAME"
+            
+            echo "Created branch: $BRANCH_NAME"
+            
+            # Añadir comentario a la issue con info de la rama
+            gh issue comment "$ISSUE_NUMBER" --body "🔨 Branch \`$BRANCH_NAME\` was automatically created for this issue."
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
 
-      # When task moves to "In Review" column
-      - name: Create PR when moved to In Review
-        if: ${{ fromJson(steps.card.outputs.result).columnName == 'In Review' && fromJson(steps.card.outputs.result).issueNumber != null }}
+      - name: Create PR for issue (In Review)
+        if: |
+          fromJson(steps.issue_data.outputs.result).issue && 
+          (fromJson(steps.project_status.outputs.result).status == env.IN_REVIEW_STATUS || 
+           (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'pr_creation'))
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
           script: |
-            const issueNumber = ${{ fromJson(steps.card.outputs.result).issueNumber }};
-            const issueTitle = '${{ fromJson(steps.card.outputs.result).issueTitle }}';
+            const issue = fromJson(steps.issue_data.outputs.result).issue;
+            const issueNumber = issue.number;
+            const issueTitle = issue.title;
             
-            // List branches that might be related to this issue
+            // Listar ramas que podrían estar relacionadas con esta issue
             const { data: branches } = await github.rest.repos.listBranches({
               owner: context.repo.owner,
               repo: context.repo.repo
             });
             
-            // Look for branch with issue number in name
+            // Buscar rama con el número de issue en el nombre
             const issueBranch = branches.find(branch => branch.name.includes(`/${issueNumber}-`));
             
             if (!issueBranch) {
@@ -135,7 +295,20 @@ jobs:
               return;
             }
             
-            // Create PR
+            // Verificar si ya existe un PR para esta rama
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${issueBranch.name}`,
+              state: 'open'
+            });
+            
+            if (prs.length > 0) {
+              console.log(`PR already exists for branch ${issueBranch.name}`);
+              return;
+            }
+            
+            // Crear PR
             try {
               const { data: pr } = await github.rest.pulls.create({
                 owner: context.repo.owner,
@@ -143,12 +316,12 @@ jobs:
                 title: issueTitle,
                 body: `Resolves #${issueNumber}`,
                 head: issueBranch.name,
-                base: 'main'
+                base: process.env.BASE_BRANCH
               });
               
               console.log(`Created PR #${pr.number} for issue #${issueNumber}`);
               
-              // Add comment on the issue
+              // Añadir comentario en la issue
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -159,74 +332,62 @@ jobs:
               console.error(`Error creating PR: ${error.message}`);
             }
 
-  handle_pr_merged:
-    runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
-    steps:
       - name: Move issue to Done when PR is merged
+        if: |
+          github.event_name == 'pull_request' && 
+          github.event.pull_request.merged == true && 
+          fromJson(steps.issue_data.outputs.result).issue
         uses: actions/github-script@v6
         with:
           github-token: ${{ secrets.PAT_TOKEN }}
           script: |
-            // Extract issue number from PR body
-            const prBody = context.payload.pull_request.body;
-            const matches = prBody.match(/[Rr]esolves #(\d+)/);
+            const issue = fromJson(steps.issue_data.outputs.result).issue;
+            const projectData = fromJson(steps.project_status.outputs.result);
             
-            if (!matches) {
-              console.log('No linked issue found in PR body');
+            if (!projectData.itemId || !projectData.statusFieldId) {
+              console.log(`Issue #${issue.number} not properly configured in project`);
               return;
             }
             
-            const issueNumber = matches[1];
-            console.log(`Found linked issue: #${issueNumber}`);
-            
-            // Get project columns
-            const { data: projects } = await github.rest.projects.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open'
-            });
-            
-            if (projects.length === 0) {
-              console.log('No projects found');
+            // Buscar la opción "Done" entre las opciones de estado
+            const doneStatusOption = projectData.statusOptions.find(option => option.name === process.env.DONE_STATUS);
+            if (!doneStatusOption) {
+              console.log(`"${process.env.DONE_STATUS}" status option not found in project`);
               return;
             }
             
-            // Find the Done column in the project
-            for (const project of projects) {
-              const { data: columns } = await github.rest.projects.listColumns({
-                project_id: project.id
+            // Cambiar el estado a "Done"
+            const updateMutation = `
+            mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $projectId,
+                itemId: $itemId,
+                fieldId: $fieldId,
+                value: { singleSelectOptionId: $optionId }
+              }) {
+                projectV2Item {
+                  id
+                }
+              }
+            }`;
+            
+            try {
+              await github.graphql(updateMutation, {
+                projectId: projectData.projectId,
+                itemId: projectData.itemId,
+                fieldId: projectData.statusFieldId,
+                optionId: doneStatusOption.id
               });
               
-              const doneColumn = columns.find(column => column.name === 'Done');
-              if (!doneColumn) {
-                console.log(`No 'Done' column found in project ${project.name}`);
-                continue;
-              }
+              console.log(`Moved issue #${issue.number} to ${process.env.DONE_STATUS} status`);
               
-              // Find the card for this issue
-              let issueCards = [];
-              for (const column of columns) {
-                const { data: cards } = await github.rest.projects.listCards({
-                  column_id: column.id
-                });
-                
-                for (const card of cards) {
-                  if (card.content_url && card.content_url.includes(`/issues/${issueNumber}`)) {
-                    issueCards.push({ card, columnId: column.id });
-                  }
-                }
-              }
-              
-              // Move the card to the Done column
-              for (const {card, columnId} of issueCards) {
-                if (columnId !== doneColumn.id) {
-                  await github.rest.projects.moveCard({
-                    card_id: card.id,
-                    position: 'top',
-                    column_id: doneColumn.id
-                  });
-                  console.log(`Moved issue #${issueNumber} to Done column in project ${project.name}`);
-                }
-              }
+              // Añadir comentario en la issue
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `✅ This issue has been automatically moved to \`${process.env.DONE_STATUS}\` after the PR was merged.`
+              });
+            } catch (error) {
+              console.error(`Error updating project item: ${error.message}`);
             }
